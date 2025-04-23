@@ -4,6 +4,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 #########
 # Losses
@@ -65,3 +66,70 @@ class AngularLoss(nn.Module):
                 angle = angle[mask]
             loss = angle.mean()
         return loss
+
+# Texture Loss
+class TextureLoss(nn.Module):
+    def __init__(self, l1_weight=1.0, perceptual_weight=0.1):
+        super(TextureLoss, self).__init__()
+        self.name = "TextureLoss"
+        self.l1_weight = l1_weight
+        self.perceptual_weight = perceptual_weight
+        
+    def forward(self, prediction, target, mask=None):
+        """
+        Compute loss between predicted texture and target texture
+        
+        Args:
+            prediction: Predicted texture map [B, 3, H, W]
+            target: Target texture map [B, 3, H, W]
+            mask: Optional mask for valid pixels [B, 1, H, W]
+            
+        Returns:
+            Combined loss value
+        """
+        with torch.autocast(device_type='cuda', enabled=False):
+            prediction = prediction.float()
+            target = target.float()
+            
+            # Apply mask if provided
+            if mask is not None:
+                if mask.ndim == 4:
+                    # Expand mask to match RGB channels
+                    mask_expanded = mask.expand(-1, 3, -1, -1)
+                    
+                    # Check if mask has any valid pixels
+                    if mask_expanded.any():
+                        # L1 loss on masked pixels
+                        l1_loss = F.l1_loss(
+                            prediction[mask_expanded], 
+                            target[mask_expanded]
+                        )
+                    else:
+                        l1_loss = torch.tensor(0.0, device=prediction.device)
+                else:
+                    # Handle case where mask is not 4D
+                    l1_loss = F.l1_loss(prediction, target)
+            else:
+                # No mask, compute loss on all pixels
+                l1_loss = F.l1_loss(prediction, target)
+            
+            # Simple perceptual loss using differences at multiple scales
+            perceptual_loss = torch.tensor(0.0, device=prediction.device)
+            if self.perceptual_weight > 0:
+                for scale in [1, 2, 4]:
+                    if scale > 1:
+                        # Downsample both prediction and target
+                        pred_down = F.avg_pool2d(prediction, kernel_size=scale, stride=scale)
+                        target_down = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+                        
+                        # Compute L1 loss at this scale
+                        scale_loss = F.l1_loss(pred_down, target_down)
+                        perceptual_loss += scale_loss
+                
+                # Average the perceptual loss across scales
+                perceptual_loss /= 3.0
+            
+            # Combine losses
+            total_loss = self.l1_weight * l1_loss + self.perceptual_weight * perceptual_loss
+            
+        return total_loss

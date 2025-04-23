@@ -10,6 +10,7 @@ import numpy as np
 import random
 import pandas as pd
 import cv2
+import glob
 
 #################
 # Dataset Mixer
@@ -374,3 +375,101 @@ class VirtualKITTI2(Dataset):
         normal_tensor[2,~valid_depth_mask.squeeze()] = 0
 
         return {"rgb": rgb_tensor, "depth": depth_tensor, 'metric': metric_tensor, 'normals': normal_tensor, "val_mask": valid_depth_mask, "domain": "outdoor"}
+
+# Head to Texture Dataset
+class HeadTextureDataset(Dataset):
+    def __init__(self, root_dir, transform=True, image_size=(512, 512)):
+        self.root_dir = root_dir
+        self.pairs = self._find_pairs()
+        
+        # Define transforms
+        if transform:
+            self.transform = transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ToTensor()
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.ToTensor()
+            ])
+
+    def _find_pairs(self):
+        """
+        Find pairs of head images and corresponding texture maps.
+        Expected directory structure:
+        root_dir/
+            heads/
+                image1.jpg
+                image2.jpg
+                ...
+            textures/
+                image1.jpg
+                image2.jpg
+                ...
+        """
+        pairs = []
+        head_dir = os.path.join(self.root_dir, "heads")
+        texture_dir = os.path.join(self.root_dir, "textures")
+        
+        if not os.path.exists(head_dir) or not os.path.exists(texture_dir):
+            raise ValueError(f"Both 'heads' and 'textures' directories must exist in {self.root_dir}")
+        
+        # Get all image files in the heads directory
+        head_files = []
+        for ext in ['*.jpg', '*.jpeg', '*.png']:
+            head_files.extend(glob.glob(os.path.join(head_dir, ext)))
+        
+        # For each head image, find the corresponding texture map
+        for head_path in head_files:
+            head_filename = os.path.basename(head_path)
+            base_name = os.path.splitext(head_filename)[0]
+            
+            # Look for matching texture file with any extension
+            texture_path = None
+            for ext in ['.jpg', '.jpeg', '.png']:
+                potential_path = os.path.join(texture_dir, base_name + ext)
+                if os.path.exists(potential_path):
+                    texture_path = potential_path
+                    break
+            
+            if texture_path:
+                pairs.append((head_path, texture_path))
+        
+        if not pairs:
+            raise ValueError(f"No matching head-texture pairs found in {self.root_dir}")
+            
+        return pairs
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        head_path, texture_path = self.pairs[idx]
+        
+        # Load images
+        head_image = Image.open(head_path).convert('RGB')
+        texture_image = Image.open(texture_path).convert('RGB')
+        
+        # Apply transforms
+        head_tensor = self.transform(head_image)
+        texture_tensor = self.transform(texture_image)
+        
+        # Normalize to [-1, 1] range as expected by the model
+        head_tensor = head_tensor * 2.0 - 1.0
+        texture_tensor = texture_tensor * 2.0 - 1.0
+        
+        # Create a valid mask (all pixels are valid in this case)
+        valid_mask = torch.ones((1, head_tensor.shape[1], head_tensor.shape[2])).bool()
+        
+        # Stack texture tensor for compatibility with the model
+        texture_stacked = texture_tensor.clone()
+        
+        return {
+            "rgb": head_tensor,  
+            "depth": texture_stacked,  # This will be used by the VAE encoder
+            "texture": texture_tensor,  # This is our target
+            "val_mask": valid_mask,
+            "domain": "texture"
+        }

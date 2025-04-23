@@ -30,7 +30,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 from torch.optim.lr_scheduler import LambdaLR
 from dataloaders.load import *
 from util.noise import pyramid_noise_like
-from util.loss import ScaleAndShiftInvariantLoss, AngularLoss
+from util.loss import ScaleAndShiftInvariantLoss, AngularLoss, TextureLoss
 from util.unet_prep import replace_unet_conv_in
 from util.lr_scheduler import IterExponential
 
@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--modality",
         type=str,
-        choices=["depth", "normals"],
+        choices=["depth", "normals", "texture"],
         required=True,
     )
     parser.add_argument(
@@ -357,13 +357,27 @@ def main():
     lr_scheduler = LambdaLR(optimizer=optimizer, lr_lambda=lr_func)
 
     # Training datasets
-    hypersim_root_dir = "data/hypersim/processed"
-    vkitti_root_dir   = "data/virtual_kitti_2"
-    train_dataset_hypersim = Hypersim(root_dir=hypersim_root_dir, transform=True)
-    train_dataset_vkitti   = VirtualKITTI2(root_dir=vkitti_root_dir, transform=True)
-    train_dataloader_vkitti   = torch.utils.data.DataLoader(train_dataset_vkitti,   shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
-    train_dataloader_hypersim = torch.utils.data.DataLoader(train_dataset_hypersim, shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
-    train_dataloader = MixedDataLoader(train_dataloader_hypersim, train_dataloader_vkitti, split1=9, split2=1)
+    if args.modality == "texture":
+        # For texture modality, use the HeadTextureDataset
+        texture_root_dir = "data/head_texture"  # This should be the path to your head-texture dataset
+        train_dataset = HeadTextureDataset(root_dir=texture_root_dir, transform=True, image_size=(512, 512))
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, 
+            shuffle=True, 
+            batch_size=args.train_batch_size, 
+            num_workers=args.dataloader_num_workers
+        )
+        logger.info(f"Loaded texture dataset with {len(train_dataset)} samples")
+    else:
+        # For depth and normals modalities, use the original datasets
+        hypersim_root_dir = "data/hypersim/processed"
+        vkitti_root_dir   = "data/virtual_kitti_2"
+        train_dataset_hypersim = Hypersim(root_dir=hypersim_root_dir, transform=True)
+        train_dataset_vkitti   = VirtualKITTI2(root_dir=vkitti_root_dir, transform=True)
+        train_dataloader_vkitti   = torch.utils.data.DataLoader(train_dataset_vkitti,   shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
+        train_dataloader_hypersim = torch.utils.data.DataLoader(train_dataset_hypersim, shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
+        train_dataloader = MixedDataLoader(train_dataloader_hypersim, train_dataloader_vkitti, split1=9, split2=1)
+        logger.info(f"Loaded depth/normals datasets with {len(train_dataset_vkitti)+len(train_dataset_hypersim)} samples")
 
     # Prepare everything with `accelerator` (Move to GPU)
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -404,7 +418,10 @@ def main():
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset_vkitti)+len(train_dataset_hypersim)}")
+    if args.modality == "texture":
+        logger.info(f"  Num examples = {len(train_dataset)}")
+    else:
+        logger.info(f"  Num examples = {len(train_dataset_vkitti)+len(train_dataset_hypersim)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -450,6 +467,7 @@ def main():
     # Init task specific losses
     ssi_loss           = ScaleAndShiftInvariantLoss()
     angular_loss_norm  = AngularLoss()
+    texture_loss       = TextureLoss(l1_weight=1.0, perceptual_weight=0.1)
 
     # Pre-compute empty text CLIP encoding
     empty_token    = tokenizer([""], padding="max_length", truncation=True, return_tensors="pt").input_ids
@@ -538,6 +556,10 @@ def main():
                         current_estimate = current_estimate / norm
                         current_estimate = torch.clamp(current_estimate,-1,1)
                         ground_truth = batch["normals"].to(device=accelerator.device, dtype=weight_dtype)
+                    elif args.modality == "texture":
+                        # For texture maps, we keep the RGB output as is
+                        current_estimate = torch.clamp(current_estimate, -1, 1)
+                        ground_truth = batch["texture"].to(device=accelerator.device, dtype=weight_dtype)
                     else:
                         raise ValueError(f"Unknown modality {args.modality}")
 
@@ -551,6 +573,10 @@ def main():
                         estimation_loss_ang_norm = angular_loss_norm(current_estimate, ground_truth, val_mask)
                         if not torch.isnan(estimation_loss_ang_norm).any():
                             estimation_loss = estimation_loss + estimation_loss_ang_norm
+                    elif args.modality == "texture":
+                        estimation_loss_texture = texture_loss(current_estimate, ground_truth, val_mask)
+                        if not torch.isnan(estimation_loss_texture).any():
+                            estimation_loss = estimation_loss + estimation_loss_texture
                     else:
                         raise ValueError(f"Unknown modality {args.modality}")
                     loss = loss + estimation_loss
