@@ -8,6 +8,9 @@ import logging
 import math
 import os
 import shutil
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
 
 import accelerate
 import datasets
@@ -600,7 +603,7 @@ def main():
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
                 train_loss = 0.0
-                # Save model checkpoint 
+                # Save model checkpoint and inference samples
                 if global_step % args.checkpointing_steps == 0:
                     logger.info(f"Entered Saving Code at global step {global_step} checkpointing_steps {args.checkpointing_steps}")
                     if accelerator.is_main_process:
@@ -620,9 +623,145 @@ def main():
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
+                        
+                        # Save checkpoint state
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        
+                        # Generate and save inference samples
+                        logger.info(f"Generating inference samples at step {global_step}")
+                        
+                        # Create samples directory
+                        samples_dir = os.path.join(save_path, "inference_samples")
+                        os.makedirs(samples_dir, exist_ok=True)
+                        
+                        # Set model to eval mode for inference
+                        unet.eval()
+                        
+                        # Get a few test samples (use the first few samples from the batch)
+                        num_samples = min(4, len(batch["rgb"]))
+                        
+                        with torch.no_grad():
+                            for i in range(num_samples):
+                                # Get input image
+                                input_image = batch["rgb"][i:i+1].to(device=accelerator.device, dtype=weight_dtype)
+                                
+                                # Encode input image
+                                input_latent = encode_image(vae, input_image)
+                                input_latent = input_latent * vae.config.scaling_factor
+                                
+                                # Create noise latent
+                                if (args.noise_type is None) or (args.noise_type == "zeros"):
+                                    noise_latent = torch.zeros_like(input_latent).to(accelerator.device)
+                                elif args.noise_type == "pyramid":
+                                    noise_latent = pyramid_noise_like(input_latent).to(accelerator.device)
+                                elif args.noise_type == "gaussian":
+                                    noise_latent = torch.randn_like(input_latent).to(accelerator.device)
+                                
+                                # Set timestep to first denoising step
+                                timestep = torch.ones((1,), device=input_latent.device) * (noise_scheduler.config.num_train_timesteps-1)
+                                timestep = timestep.long()
+                                
+                                # Get text encoding (empty)
+                                text_embed = empty_encoding.repeat(1, 1, 1)
+                                
+                                # Prepare model input
+                                model_input = (
+                                    torch.cat((input_latent, noise_latent), dim=1).to(accelerator.device)
+                                    if args.noise_type is not None
+                                    else input_latent
+                                )
+                                
+                                # Generate prediction
+                                pred = unet(model_input, timestep, text_embed, return_dict=False)[0]
+                                
+                                # Convert to latent
+                                alpha_prod_t = alpha_prod[timestep].view(-1, 1, 1, 1)
+                                beta_prod_t = beta_prod[timestep].view(-1, 1, 1, 1)
+                                
+                                if noise_scheduler.config.prediction_type == "v_prediction":
+                                    pred_latent = (alpha_prod_t**0.5) * noise_latent - (beta_prod_t**0.5) * pred
+                                elif noise_scheduler.config.prediction_type == "epsilon":
+                                    pred_latent = (noise_latent - beta_prod_t ** (0.5) * pred) / alpha_prod_t ** (0.5)
+                                elif noise_scheduler.config.prediction_type == "sample":
+                                    pred_latent = pred
+                                
+                                # Decode to image
+                                pred_latent = pred_latent / vae.config.scaling_factor
+                                pred_image = decode_image(vae, pred_latent)
+                                
+                                # Process based on modality
+                                if args.modality == "depth":
+                                    pred_image = pred_image.mean(dim=1, keepdim=True)
+                                    pred_image = torch.clamp(pred_image, -1, 1)
+                                    # Convert to numpy and save
+                                    pred_np = pred_image.cpu().numpy().squeeze()
+                                    # Normalize to 0-1 for visualization
+                                    pred_np = (pred_np + 1) / 2
+                                    
+                                    # Save input image
+                                    input_np = input_image.cpu().numpy().squeeze().transpose(1, 2, 0)
+                                    input_np = (input_np + 1) / 2
+                                    input_np = (input_np * 255).astype(np.uint8)
+                                    input_pil = Image.fromarray(input_np)
+                                    input_pil.save(os.path.join(samples_dir, f"sample_{i}_input.png"))
+                                    
+                                    # Save depth map
+                                    import matplotlib.pyplot as plt
+                                    plt.figure(figsize=(8, 8))
+                                    plt.imshow(pred_np, cmap='plasma')
+                                    plt.axis('off')
+                                    plt.savefig(os.path.join(samples_dir, f"sample_{i}_depth.png"), bbox_inches='tight')
+                                    plt.close()
+                                    
+                                elif args.modality == "normals":
+                                    # Normalize normals
+                                    norm = torch.norm(pred_image, p=2, dim=1, keepdim=True) + 1e-5
+                                    pred_image = pred_image / norm
+                                    pred_image = torch.clamp(pred_image, -1, 1)
+                                    
+                                    # Convert to numpy and save
+                                    pred_np = pred_image.cpu().numpy().squeeze().transpose(1, 2, 0)
+                                    # Convert from [-1,1] to [0,1] for visualization
+                                    pred_np = (pred_np + 1) / 2
+                                    pred_np = (pred_np * 255).astype(np.uint8)
+                                    
+                                    # Save input image
+                                    input_np = input_image.cpu().numpy().squeeze().transpose(1, 2, 0)
+                                    input_np = (input_np + 1) / 2
+                                    input_np = (input_np * 255).astype(np.uint8)
+                                    input_pil = Image.fromarray(input_np)
+                                    input_pil.save(os.path.join(samples_dir, f"sample_{i}_input.png"))
+                                    
+                                    # Save normals
+                                    pred_pil = Image.fromarray(pred_np)
+                                    pred_pil.save(os.path.join(samples_dir, f"sample_{i}_normals.png"))
+                                    
+                                elif args.modality == "texture":
+                                    # For texture, just clamp and save
+                                    pred_image = torch.clamp(pred_image, -1, 1)
+                                    
+                                    # Convert to numpy and save
+                                    pred_np = pred_image.cpu().numpy().squeeze().transpose(1, 2, 0)
+                                    # Convert from [-1,1] to [0,1] for visualization
+                                    pred_np = (pred_np + 1) / 2
+                                    pred_np = (pred_np * 255).astype(np.uint8)
+                                    
+                                    # Save input image
+                                    input_np = input_image.cpu().numpy().squeeze().transpose(1, 2, 0)
+                                    input_np = (input_np + 1) / 2
+                                    input_np = (input_np * 255).astype(np.uint8)
+                                    input_pil = Image.fromarray(input_np)
+                                    input_pil.save(os.path.join(samples_dir, f"sample_{i}_input.png"))
+                                    
+                                    # Save texture
+                                    pred_pil = Image.fromarray(pred_np)
+                                    pred_pil.save(os.path.join(samples_dir, f"sample_{i}_texture.png"))
+                        
+                        # Set model back to train mode
+                        unet.train()
+                        logger.info(f"Saved inference samples to {samples_dir}")
 
             # Log loss and learning rate for progress bar
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
